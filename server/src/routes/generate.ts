@@ -109,6 +109,12 @@ async function pollUntilDone(aceJobId: string, job: GenerationJob, signal: Abort
   let lastProgressAt = Date.now();
   let lastStage = job.stage;
   let lastProgress = job.progress;
+  // Heartbeat from the ace-server poll body (phase + phase_step). The engine
+  // bumps phase_step every ~5 s during long synchronous loads (DiT / adapter
+  // precompute) via LoadProgressTicker, so this heartbeat changes even when
+  // no stdout log line moves the parsed stage/progress. Without it the
+  // 120 s STALE_TIMEOUT_MS kills 8-min cold reloads at exactly the 120 s mark.
+  let lastAceHeartbeat = '';
 
   while (true) {
     if (signal.aborted || job.status === 'cancelled') {
@@ -151,6 +157,14 @@ async function pollUntilDone(aceJobId: string, job: GenerationJob, signal: Abort
         const step = status.phase_step ?? 0;
         const total = status.phase_total ?? 0;
         job.acePhaseProgress = total > 0 ? `step ${step}/${total}` : '';
+        // Feed the engine's phase+step into the watchdog heartbeat so a
+        // long load (LoadProgressTicker bumps step every ~5 s) keeps
+        // STALE_TIMEOUT_MS from firing.
+        const aceHeartbeat = `${status.phase}|${step}|${total}`;
+        if (aceHeartbeat !== lastAceHeartbeat) {
+          lastProgressAt = Date.now();
+          lastAceHeartbeat = aceHeartbeat;
+        }
       }
       if (status.status === 'done') return;
       if (status.status === 'failed') throw new Error('Generation failed on ace-server');
