@@ -159,8 +159,11 @@ async function pollUntilDone(aceJobId: string, job: GenerationJob, signal: Abort
         job.acePhaseProgress = total > 0 ? `step ${step}/${total}` : '';
         // Feed the engine's phase+step into the watchdog heartbeat so a
         // long load (LoadProgressTicker bumps step every ~5 s) keeps
-        // STALE_TIMEOUT_MS from firing.
-        const aceHeartbeat = `${status.phase}|${step}|${total}`;
+        // STALE_TIMEOUT_MS from firing. adapter_progress covers the lazy
+        // inference-time DiT reload (adapter swap under keep-loaded), where
+        // phase is dit_inference and phase_step stays 0 for the entire
+        // multi-minute delta precompute — it is the only moving signal there.
+        const aceHeartbeat = `${status.phase}|${step}|${total}|${status.adapter_progress ?? -1}`;
         if (aceHeartbeat !== lastAceHeartbeat) {
           lastProgressAt = Date.now();
           lastAceHeartbeat = aceHeartbeat;

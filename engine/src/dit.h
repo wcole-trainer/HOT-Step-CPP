@@ -297,6 +297,10 @@ static struct ggml_tensor * dit_load_proj_out_w(WeightCtx *          wctx,
     return dst;
 }
 
+// Forward declaration — dit_ggml_load's adapter-failure path frees the
+// partially-constructed model (wctx already holds GPU weights by then).
+static void dit_ggml_free(DiTGGML * m);
+
 // Load full DiT model from GGUF or safetensors
 static bool dit_ggml_load(DiTGGML *    m,
                           const char * path,
@@ -561,7 +565,18 @@ static bool dit_ggml_load(DiTGGML *    m,
             Timer rt_timer;
             if (!adapter_load_runtime(&m->lora, &m->wctx, ws, adapter_path, adapter_scale,
                                        g_hotstep_params.adapter_group_scales, m->backend)) {
-                fprintf(stderr, "[Adapter-RT] WARNING: runtime adapter load failed\n");
+                // A failed or cancelled runtime adapter load MUST fail the DiT
+                // load. Returning true here poisons the ModelStore: the DiT is
+                // cached under a key that includes adapter_path while carrying
+                // zero deltas (m->lora.active == false), so every subsequent
+                // render with this (model, adapter, scale) silently produces
+                // base-model output — an artist request rendering generic audio
+                // with no error anywhere. Fail loudly instead: the store
+                // installs nothing and the next render retries the precompute.
+                fprintf(stderr, "[Adapter-RT] FATAL: runtime adapter load failed/cancelled — failing DiT load\n");
+                if (is_st) { st_multi_close(&sm); } else { gf_close(&gf); }
+                dit_ggml_free(m);  // wctx holds ~4 GB of GPU weights by now — must release
+                return false;
             }
             fprintf(stderr, "[Adapter-RT] Load time: %.1f ms\n", rt_timer.ms());
         }

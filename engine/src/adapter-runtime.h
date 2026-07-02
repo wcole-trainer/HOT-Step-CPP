@@ -198,6 +198,8 @@ static bool adapter_runtime_lora(DiTLoRA *                  lora,
             cancelled = true;
             break;
         }
+        // Heartbeat for external watchdogs (surfaced via /job adapter_progress).
+        g_adapter_progress.store(merged + skipped, std::memory_order_relaxed);
 
         const std::string & gguf_name = kv.first;
         const STEntry *     ea        = kv.second;
@@ -365,6 +367,8 @@ static bool adapter_runtime_lokr(DiTLoRA *                  lora,
             cancelled = true;
             break;
         }
+        // Heartbeat for external watchdogs (surfaced via /job adapter_progress).
+        g_adapter_progress.store(merged + skipped, std::memory_order_relaxed);
 
         const std::string & lyc_prefix = kv.first;
         const LoKrEntry &   m          = kv.second;
@@ -554,6 +558,13 @@ static bool adapter_load_runtime(DiTLoRA *                  lora,
                                   float                      adapter_scale,
                                   const AdapterGroupScales & gs,
                                   ggml_backend_t             backend) {
+    // Reset the watchdog-heartbeat counter to "inactive" on every exit path
+    // (success, cancel, failure) so a stale index never leaks into the next
+    // job's /job responses.
+    struct ProgressGuard {
+        ~ProgressGuard() { g_adapter_progress.store(-1, std::memory_order_release); }
+    } progress_guard;
+
     // Estimate max deltas (24 layers × 11 projections = 264, plus non-layer weights)
     int max_deltas = DIT_LORA_MAX_LAYERS * 11 + 32;
     size_t ctx_size = (size_t) max_deltas * ggml_tensor_overhead() + 4096;
