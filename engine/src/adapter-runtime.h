@@ -66,10 +66,16 @@ struct DiTLoRALayer {
 
 #define DIT_LORA_MAX_LAYERS 32
 
-// Staged delta: pairs a tensor pointer with its F32 data for upload after buffer allocation
+// Staged delta: pairs a tensor pointer with its BF16 data for upload after
+// buffer allocation. Staged as BF16 (not F32): the full delta set for a
+// 32-layer DiT is ~7.9 GB in BF16 but ~15.8 GB in F32 — on a 16 GB host the
+// F32 staging pushed the process deep into swap and the upload loop crawled
+// at disk speed (observed: a "seconds" upload taking 25+ min, watchdogs
+// killing the load). Converting at stage time also touches the data while
+// it is still cache-hot from the delta compute.
 struct DiTLoRAStagedDelta {
-    struct ggml_tensor * tensor;
-    std::vector<float>   f32_data;
+    struct ggml_tensor *     tensor;
+    std::vector<ggml_bf16_t> bf16_data;
 };
 
 // Runtime LoRA storage: holds all precomputed delta tensors
@@ -87,7 +93,7 @@ struct DiTLoRA {
 
     struct ggml_context *           ctx    = nullptr;  // owns the delta tensors
     ggml_backend_buffer_t           buffer = nullptr;  // single buffer for all deltas
-    std::vector<DiTLoRAStagedDelta> staged;            // temp F32 data awaiting BF16 upload
+    std::vector<DiTLoRAStagedDelta> staged;            // BF16 staging awaiting upload
 };
 
 static void dit_lora_free(DiTLoRA * lora) {
@@ -167,9 +173,11 @@ static inline ggml_type adapter_runtime_storage_type(int64_t ne0) {
     return GGML_TYPE_BF16;
 }
 
-// Stage a precomputed delta: create the storage tensor in lora context, store F32
-// data for later (quantized) upload. The tensor and data are paired so upload
-// order doesn't matter.
+// Stage a precomputed delta: create the storage tensor in lora context and
+// convert the F32 delta to BF16 immediately (data is cache-hot from the compute;
+// halves staging RAM vs holding F32 — on a 16 GB host the F32 staging pushed the
+// process into swap and the upload crawled at disk speed; ported from fork
+// 8b01e81d). The tensor and data are paired so upload order doesn't matter.
 static void adapter_stage_delta(DiTLoRA * lora, DiTLoRADelta * slot,
                                  const std::string & gguf_name,
                                  int64_t ne0, int64_t ne1,
@@ -181,13 +189,14 @@ static void adapter_stage_delta(DiTLoRA * lora, DiTLoRADelta * slot,
     if (slot->delta != nullptr) {
         for (auto & sd : lora->staged) {
             if (sd.tensor == slot->delta) {
-                if (sd.f32_data.size() == delta_f32.size()) {
+                if (sd.bf16_data.size() == delta_f32.size()) {
+                    // Staged data is BF16 — round-trip through F32 for the sum.
                     for (size_t i = 0; i < delta_f32.size(); i++) {
-                        sd.f32_data[i] += delta_f32[i];
+                        sd.bf16_data[i] = ggml_fp32_to_bf16(ggml_bf16_to_fp32(sd.bf16_data[i]) + delta_f32[i]);
                     }
                 } else {
                     fprintf(stderr, "[Adapter-RT] WARNING: delta shape mismatch stacking %s (%zu vs %zu), skipping add\n",
-                            gguf_name.c_str(), sd.f32_data.size(), delta_f32.size());
+                            gguf_name.c_str(), sd.bf16_data.size(), delta_f32.size());
                 }
                 return;
             }
@@ -198,7 +207,9 @@ static void adapter_stage_delta(DiTLoRA * lora, DiTLoRADelta * slot,
     snprintf(tname, sizeof(tname), "lora_%s", gguf_name.c_str());
     slot->delta = ggml_new_tensor_2d(lora->ctx, adapter_runtime_storage_type(ne0), ne0, ne1);
     ggml_set_name(slot->delta, tname);
-    lora->staged.push_back({ slot->delta, std::move(delta_f32) });
+    std::vector<ggml_bf16_t> bf16(delta_f32.size());
+    ggml_fp32_to_bf16_row(delta_f32.data(), bf16.data(), (int64_t) delta_f32.size());
+    lora->staged.push_back({ slot->delta, std::move(bf16) });
 }
 
 // ─── Low-rank runtime mode (adapter_mode == "runtime_lowrank") ───
@@ -219,7 +230,9 @@ static struct ggml_tensor * adapter_stage_factor(DiTLoRA * lora, const char * ki
     snprintf(tname, sizeof(tname), "lrf_%s_%s", kind, gguf_name.c_str());
     struct ggml_tensor * t = ggml_new_tensor_2d(lora->ctx, GGML_TYPE_BF16, ne0, ne1);
     ggml_set_name(t, tname);
-    lora->staged.push_back({ t, std::move(f32) });
+    std::vector<ggml_bf16_t> bf16(f32.size());
+    ggml_fp32_to_bf16_row(f32.data(), bf16.data(), (int64_t) f32.size());
+    lora->staged.push_back({ t, std::move(bf16) });
     return t;
 }
 
@@ -830,30 +843,39 @@ static bool adapter_runtime_finalize(DiTLoRA * lora, ggml_backend_t backend) {
     }
     ggml_backend_buffer_set_usage(lora->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // Upload: quantize/convert each staged F32 delta into its storage type
-    // (BF16 / Q8_0 / Q4_0). Quantization is CPU-bound and per-tensor independent,
-    // so do it in PARALLEL into host buffers first, then upload serially (GPU
-    // calls must be serialized). A single-threaded pass over 360 large tensors
-    // stalls the load for many seconds; threading keeps it snappy.
+    // Upload: convert/quantize each staged BF16 delta into its storage type
+    // (BF16 / Q8_0 / Q4_0). Staging is BF16 (fork 8b01e81d): half the RAM of
+    // F32 staging, and BF16-typed tensors upload directly with no second host
+    // buffer. Quantization is CPU-bound and per-tensor independent, so do it in
+    // PARALLEL into host buffers first, then upload serially (GPU calls must be
+    // serialized). The watchdog heartbeat keeps moving through BOTH phases —
+    // historically it froze here and external watchdogs killed the load 120 s
+    // after the precompute loop finished.
     Timer  qtimer;
     size_t n_staged = lora->staged.size();
     std::vector<std::vector<char>> host_bufs(n_staged);
     std::vector<size_t>            host_nbytes(n_staged, 0);
+    std::atomic<int>               quant_done{0};
     auto quant_worker = [&](size_t begin, size_t end) {
+        std::vector<float> f32buf;
         for (size_t j = begin; j < end; j++) {
-            struct ggml_tensor * t   = lora->staged[j].tensor;
-            const float *        src = lora->staged[j].f32_data.data();
-            int64_t              nel = ggml_nelements(t);
+            struct ggml_tensor * t     = lora->staged[j].tensor;
+            const ggml_bf16_t *  src16 = lora->staged[j].bf16_data.data();
+            int64_t              nel   = ggml_nelements(t);
             if (t->type == GGML_TYPE_BF16) {
+                // Direct upload from staged BF16 below — no host copy needed.
                 host_nbytes[j] = (size_t) nel * sizeof(ggml_bf16_t);
-                host_bufs[j].resize(host_nbytes[j]);
-                ggml_fp32_to_bf16_row(src, (ggml_bf16_t *) host_bufs[j].data(), nel);
             } else {
                 int64_t ne0 = t->ne[0], ne1 = t->ne[1];
+                f32buf.resize((size_t) nel);
+                ggml_bf16_to_fp32_row(src16, f32buf.data(), nel);
                 host_nbytes[j] = ggml_row_size(t->type, ne0) * (size_t) ne1;
                 host_bufs[j].resize(host_nbytes[j]);
-                ggml_quantize_chunk(t->type, src, host_bufs[j].data(), 0, ne1, ne0, nullptr);
+                ggml_quantize_chunk(t->type, f32buf.data(), host_bufs[j].data(), 0, ne1, ne0, nullptr);
             }
+            // Heartbeat: continue past the precompute's index range.
+            g_adapter_progress.store((int) n_staged + quant_done.fetch_add(1, std::memory_order_relaxed),
+                                     std::memory_order_relaxed);
         }
     };
     unsigned nthreads = std::thread::hardware_concurrency();
@@ -873,9 +895,15 @@ static bool adapter_runtime_finalize(DiTLoRA * lora, ggml_backend_t backend) {
     size_t total_bytes = 0;
     int    n_quant     = 0;
     for (size_t j = 0; j < n_staged; j++) {
-        ggml_backend_tensor_set(lora->staged[j].tensor, host_bufs[j].data(), 0, host_nbytes[j]);
+        // Heartbeat through the serial upload too.
+        g_adapter_progress.store((int) (2 * n_staged + j), std::memory_order_relaxed);
+        if (lora->staged[j].tensor->type == GGML_TYPE_BF16) {
+            ggml_backend_tensor_set(lora->staged[j].tensor, lora->staged[j].bf16_data.data(), 0, host_nbytes[j]);
+        } else {
+            ggml_backend_tensor_set(lora->staged[j].tensor, host_bufs[j].data(), 0, host_nbytes[j]);
+            n_quant++;
+        }
         total_bytes += host_nbytes[j];
-        if (lora->staged[j].tensor->type != GGML_TYPE_BF16) n_quant++;
     }
     fprintf(stderr, "[Adapter-RT] Quantize+upload: %.1f ms (%u threads)\n", qtimer.ms(), nthreads);
 
@@ -958,7 +986,7 @@ static void adapter_runtime_rebase(DiTLoRA *            lora,
             if (!s) {
                 continue;  // not in S / conv / shape mismatch — same skips as merge
             }
-            if ((int64_t) sd.f32_data.size() != nel) {
+            if ((int64_t) sd.bf16_data.size() != nel) {
                 continue;
             }
             ggml_type    ttype = GGML_TYPE_F32;
@@ -989,10 +1017,13 @@ static void adapter_runtime_rebase(DiTLoRA *            lora,
                     convrot_transform_rows(tbuf.data(), ne1, ne0, it->second);
                 }
             }
-            float * d = sd.f32_data.data();
+            // Staged data is BF16 — round-trip through F32 for the fold.
+            std::vector<float> dbuf((size_t) nel);
+            ggml_bf16_to_fp32_row(sd.bf16_data.data(), dbuf.data(), nel);
             for (int64_t i = 0; i < nel; i++) {
-                d[i] += rebase_beta * (s[i] - tbuf[i]);
+                dbuf[i] += rebase_beta * (s[i] - tbuf[i]);
             }
+            ggml_fp32_to_bf16_row(dbuf.data(), sd.bf16_data.data(), nel);
             nudged.fetch_add(1, std::memory_order_relaxed);
         }
     };
